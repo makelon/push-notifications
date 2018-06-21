@@ -1,0 +1,333 @@
+<html>
+<head>
+<title>Notification test</title>
+<script type="text/javascript">
+var serviceWorkerUrl = 'svcwrk.js',
+	pushServerSecret = '', // PushServerSecret from conf/config.php
+	pushServerUrl = '', // URL to public/index.php
+	pushServerKey = urlBase64(''); // Public VAPID key
+
+function urlBase64(s) {
+	return btoa(s)
+		.replace(/=+$/, '')
+		.replace(/\//g, '_')
+		.replace(/\+/g, '-');
+}
+
+function Notify() {
+	this.notifyPermitted = false;
+	this.serviceWorker = undefined;
+	this.pushSubscription = undefined;
+}
+
+Notify.prototype = {
+	initText() {
+		if (
+			!('Notification' in window) // Browser doesn't support notifications
+			|| Notification['permission'] === 'denied' // Blocked by browser setting (probably)
+		) {
+			return Promise.reject(new Error('Permission denied'));
+		}
+		if (this.notifyPermitted) {
+			return Promise.resolve(true);
+		}
+		return new Promise((resolve, reject) => {
+			(Notification['permission'] === 'granted'
+				? Promise.resolve('granted')
+				: Notification.requestPermission(permission => Promise.resolve(permission))
+			).then((permission) => {
+				if (permission !== 'granted') {
+					// Blocked by user action
+					reject(new Error('Permission denied'));
+					return;
+				}
+				if ('serviceWorker' in navigator) {
+					// Service worker notifications are the future proof method
+					navigator.serviceWorker.register(serviceWorkerUrl).then(registration => {
+						this.serviceWorker = registration;
+						resolve();
+					});
+				}
+				else {
+					// Fall back to the Notification class
+					resolve();
+				}
+			});
+		}).then(() => {
+			this.notifyPermitted = true;
+		});
+	},
+
+	initPush() {
+		if (!pushServerKey || !('PushManager' in window)) {
+			return Promise.reject(new Error('No browser support'));
+		}
+		if (this.pushSubscription) {
+			return Promise.resolve();
+		}
+		return this.initText()
+			.then(() => {
+				if (!this.serviceWorker) {
+					throw new Error('Failed to register service worker');
+				}
+				return this.serviceWorker.pushManager.getSubscription();
+			}).then(subscription => {
+				if (
+					subscription
+					&& (!('expirationTime' in subscription)
+					|| subscription.expirationTime === null
+					|| subscription.expirationTime > Date.now())
+				) {
+					console.log('Using existing subscription');
+					return subscription;
+				}
+				console.log('Creating new subscription');
+				return this.serviceWorker.pushManager.subscribe({
+					userVisibleOnly: true,
+					applicationServerKey: pushServerKey
+				});
+			}).then(subscription => {
+				this.pushSubscription = subscription;
+				$subscription.innerText = subscription.endpoint;
+			});
+	},
+
+	savePush() {
+		return this.initPush()
+			.then(() => {
+				var fetchOpts = {
+						method: 'POST',
+						body: JSON.stringify()
+					},
+					postParams = {
+						subscription: this.pushSubscription,
+						platforms: $platforms.value.split(',')
+					};
+				if ($catFilters.value) {
+					postParams.cat = $catFilters.value.split(',');
+				}
+				if ($dogFilters.value) {
+					postParams.dog = $dogFilters.value.split(',');
+				}
+				fetchOpts.body = JSON.stringify(postParams);
+				return fetch(`${pushServerUrl}/add`, fetchOpts);
+			});
+	},
+
+	testPush() {
+		return this.initPush()
+			.then(() => {
+				var fetchOpts = {
+					method: 'POST',
+					body: JSON.stringify({
+						subscription: this.pushSubscription,
+						payload: {
+							title: 'New notification!',
+							body: 'I wonder what it says.'
+						}
+					})
+				}
+				return fetch(`${pushServerUrl}/test`, fetchOpts);
+			});
+	},
+
+	deletePush() {
+		return this.initPush()
+			.then(() => {
+				var fetchOpts = {
+						method: 'POST',
+						body: JSON.stringify({
+							endpoint: this.pushSubscription.endpoint
+						})
+					},
+					platform = $platforms.value.split(',')[0]
+				return fetch(`${pushServerUrl}/${platform}/delete`, fetchOpts);
+			});
+	},
+
+	getData() {
+		return this.initPush()
+			.then(() => fetch(`${pushServerUrl}/${urlBase64(this.pushSubscription.endpoint)}`))
+			.then(response => response.text())
+			.then(response => {
+				response = JSON.parse(response);
+				if (typeof response === 'object') {
+					$catFilters.value = 'cat' in response ? response.cat.join(', ') : '';
+					$dogFilters.value = 'dog' in response ? response.dog.join(', ') : '';
+				}
+				else {
+					console.log('Invalid response', response);
+				}
+			});
+	},
+
+	getSubscription() {
+		return new Promise((resolve, reject) => {
+			if (!('PushManager' in window) || !('serviceWorker' in navigator)) {
+				reject(new Error('No browser support'));
+				return;
+			}
+			navigator.serviceWorker.register(serviceWorkerUrl)
+				.then(registration => {
+					this.serviceWorker = registration;
+					resolve();
+				});
+		}).then(() => this.serviceWorker.pushManager.getSubscription())
+		.then(subscription => {
+			if (subscription === null) {
+				throw new Error('No subscriptions found');
+			}
+			this.pushSubscription = subscription;
+			$subscription.innerText = subscription.endpoint;
+		})
+	}
+}
+
+var n = new Notify();
+
+function status(procPromise, identifier) {
+	return procPromise
+		.then(result => {
+			console.log('%s - Success', identifier);
+			if (result instanceof Response) {
+				return result.text().then(response => {
+					console.log(response);
+					return response;
+				});
+			}
+		}).catch(err => {
+			console.log('%s - Fail: %s', identifier, err.message);
+		});
+}
+
+function initText(ev) {
+	status(n.initText(), 'initText');
+}
+
+function initPush(ev) {
+	status(n.initPush(), 'initPush');
+}
+
+function savePush(ev) {
+	status(n.savePush(), 'savePush');
+}
+
+function deletePush(ev) {
+	status(n.deletePush(), 'deletePush');
+}
+
+function testPush(ev) {
+	status(n.testPush(), 'testPush')
+		.then(sendMessage);
+}
+
+function formatEntity(value) {
+	var entities = [];
+	if (typeof value === 'string') {
+		for (var tags of value.split(',')) {
+			entities.push({
+				tags: tags,
+				info: tags
+			});
+		}
+	}
+	return entities;
+}
+
+function sendPush(ev) {
+	var fetchOpts = {
+			method: 'POST',
+			body: JSON.stringify({
+				key: pushServerSecret,
+				cat: formatEntity($cats.value),
+				dog: formatEntity($dogs.value)
+			})
+		},
+		platform = $platforms.value.split(',')[0];
+	status(
+		fetch(`${pushServerUrl}/${platform}/push`, fetchOpts)
+			.then(response => {
+				var clone = response.clone();
+				if (clone.status >= 300) {
+					throw new Error(response.statusText);
+				}
+				return clone.text();
+			}).then(response => {
+				if (/\D/.test(response)) {
+					sendMessage(response);
+				}
+			}),
+		'sendPush'
+	);
+}
+
+function getPushData(ev) {
+	status(n.getData(), 'getData');
+}
+
+function getSubscription(ev) {
+	status(n.getSubscription(), 'getSubscription');
+}
+
+function sendMessage(response) {
+	var controller = navigator.serviceWorker.controller;
+	if (controller) {
+		try {
+			response = JSON.parse(response);
+			controller.postMessage(response);
+		}
+		catch(err) {}
+	}
+}
+
+</script>
+<style type="text/css">
+.label { width: 120px; display: inline-block; }
+.space { margin-bottom: 8px; }
+#subscription, #notifications { white-space: pre; }
+</style>
+</head>
+<body>
+<div class="buttons space">
+	<button id="button-init-text">Init text</button>
+	<button id="button-init-push">Init push</button>
+	<button id="button-save-push">Save push</button>
+	<button id="button-get-data">Get push data</button>
+	<button id="button-delete-push">Delete push</button>
+	<button id="button-test-push">Test push</button>
+	<button id="button-send-push">Send push</button>
+	<button id="button-get-sub">Get subscription</button>
+</div>
+<div id="subscription" class="space"></div>
+<div class="space">
+	<span class="label">Platforms:</span><input id="platforms" style="width:400px;"><br>
+	<span class="label">Cat filters:</span><input id="cat-filters" style="width:400px;"><br>
+	<span class="label">Dog filters:</span><input id="dog-filters" style="width:400px;"><br>
+</div>
+<div class="space">
+	<span class="label">Cats:</span><input id="cats" style="width:400px;"><br>
+	<span class="label">Dogs:</span><input id="dogs" style="width:400px;"><br>
+</div>
+<div class="space">
+	<div>Notifications:</div>
+	<div id="notifications"></div>
+</div>
+<script type="text/javascript">
+document.getElementById('button-init-text').addEventListener('click', initText);
+document.getElementById('button-init-push').addEventListener('click', initPush);
+document.getElementById('button-save-push').addEventListener('click', savePush);
+document.getElementById('button-get-data').addEventListener('click', getPushData);
+document.getElementById('button-delete-push').addEventListener('click', deletePush);
+document.getElementById('button-test-push').addEventListener('click', testPush);
+document.getElementById('button-send-push').addEventListener('click', sendPush);
+document.getElementById('button-get-sub').addEventListener('click', getSubscription);
+var $platforms = document.getElementById('platforms'),
+	$catFilters = document.getElementById('cat-filters'),
+	$dogFilters = document.getElementById('dog-filters'),
+	$cats = document.getElementById('cats'),
+	$dogs = document.getElementById('dogs'),
+	$subscription = document.getElementById('subscription'),
+	$notifications = document.getElementById('notifications');
+</script>
+</body>
+</html>

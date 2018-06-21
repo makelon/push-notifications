@@ -1,0 +1,5 @@
+composer.lock
+vendor
+config.php
+config.phpunit.php
+svcwrk.js
